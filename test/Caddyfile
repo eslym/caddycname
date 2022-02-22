@@ -1,0 +1,12 @@
+{
+    debug
+    admin localhost:2022
+    http_port 8080
+}
+
+http:// {
+    route {
+        cname
+    }
+    respond * {http.request.host.cname}
+}
