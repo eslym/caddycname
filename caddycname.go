@@ -1,12 +1,12 @@
 package caddycname
 
 import (
-	"context"
 	"fmt"
 	"github.com/caddyserver/caddy/v2"
 	"github.com/caddyserver/caddy/v2/caddyconfig/caddyfile"
 	"github.com/caddyserver/caddy/v2/caddyconfig/httpcaddyfile"
 	"github.com/caddyserver/caddy/v2/modules/caddyhttp"
+	"github.com/miekg/dns"
 	"go.uber.org/zap"
 	"net"
 	"net/http"
@@ -15,17 +15,20 @@ import (
 )
 
 type CaddyCNAME struct {
-	Dial     string `json:"dial,omitempty"`
-	Protocol string `json:"proto,omitempty"`
-	Lookup   string `json:"lookup,omitempty"`
+	NameServer string `json:"nameserver,omitempty"`
+	Protocol   string `json:"proto,omitempty"`
+	Lookup     string `json:"lookup,omitempty"`
+	Strict     bool   `json:"strict,omitempty"`
 
-	resolver *net.Resolver
-	logger   *zap.Logger
+	ns     string
+	lookup string
+	client *dns.Client
+	logger *zap.Logger
 }
 
 func init() {
 	caddy.RegisterModule(CaddyCNAME{})
-	httpcaddyfile.RegisterHandlerDirective("cname", parseCaddyfileHandler)
+	httpcaddyfile.RegisterHandlerDirective("resolve_cname", parseCaddyfileHandler)
 }
 
 func (CaddyCNAME) CaddyModule() caddy.ModuleInfo {
@@ -38,52 +41,53 @@ func (CaddyCNAME) CaddyModule() caddy.ModuleInfo {
 }
 
 func (c *CaddyCNAME) Provision(ctx caddy.Context) error {
+	c.client = new(dns.Client)
 	if len(c.Protocol) > 0 {
-		if !(c.Protocol == "udp" || c.Protocol == "tcp") {
-			return fmt.Errorf("%s is not a valid protocol", c.Protocol)
-		}
-	} else {
-		c.Protocol = "udp"
+		c.client.Net = c.Protocol
 	}
-	ns := "(default server)"
-	if len(c.Dial) > 0 {
-		c.resolver = &net.Resolver{
-			PreferGo: true,
-			Dial: func(ctx context.Context, network, address string) (net.Conn, error) {
-				d := net.Dialer{}
-				return d.DialContext(ctx, c.Protocol, c.Dial)
-			},
+	c.client.Timeout = 200 * time.Millisecond
+	c.client.Net = c.Protocol
+	if len(c.NameServer) == 0 {
+		config, err := dns.ClientConfigFromFile("/etc/resolv.conf")
+		if err != nil {
+			return err
 		}
-		ns = c.Protocol + "/" + c.Dial
+		if len(config.Servers) == 0 {
+			return fmt.Errorf("no server in default resolv.conf")
+		}
+		c.ns = net.JoinHostPort(config.Servers[0], config.Port)
+		c.client.Net = "udp"
 	} else {
-		c.resolver = net.DefaultResolver
+		c.ns = c.NameServer
 	}
 	if len(c.Lookup) == 0 {
-		c.Lookup = "{http.request.host}"
+		c.lookup = "{http.request.host}"
+	} else {
+		c.lookup = c.Lookup
 	}
 	c.logger = ctx.Logger(c)
-	c.logger.Debug(
-		"Using config",
-		zap.String("nameserver", ns),
-		zap.String("lookup", c.Lookup),
-	)
+	c.logger.Debug("Using config", zap.Any("config", c))
 	return nil
 }
 
 func (c CaddyCNAME) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddyhttp.Handler) error {
 	repl := r.Context().Value(caddy.ReplacerCtxKey).(*caddy.Replacer)
-	host := repl.ReplaceAll(c.Lookup, "")
+	host := repl.ReplaceAll(c.lookup, "")
 	if net.ParseIP(host) != nil {
+		if c.Strict {
+			return caddyhttp.Error(404, fmt.Errorf("unable to resolve CNAME for %s", host))
+		}
 		c.logger.Debug("host is an IP, skipping", zap.String("host", host))
 		repl.Set("http.request.host.cname", host)
 		return next.ServeHTTP(w, r)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
-	defer cancel()
-	cname, err := c.resolver.LookupCNAME(ctx, host)
+	cname, err := c.resolveCNAME(host)
 	if err == nil {
 		repl.Set("http.request.host.cname", strings.TrimRight(cname, "."))
 	} else {
+		if c.Strict {
+			return caddyhttp.Error(404, err)
+		}
 		repl.Set("http.request.host.cname", host)
 		c.logger.Warn(
 			"Unable to resolve CNAME for host",
@@ -97,7 +101,7 @@ func (c CaddyCNAME) ServeHTTP(w http.ResponseWriter, r *http.Request, next caddy
 func (c *CaddyCNAME) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 	for d.Next() {
 		if d.NextArg() {
-			c.Dial = d.Val()
+			c.NameServer = d.Val()
 		}
 		if d.NextArg() {
 			c.Lookup = d.Val()
@@ -107,9 +111,9 @@ func (c *CaddyCNAME) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 		}
 		for d.NextBlock(0) {
 			switch d.Val() {
-			case "dial":
+			case "nameserver":
 				if d.NextArg() {
-					c.Dial = d.Val()
+					c.NameServer = d.Val()
 				} else {
 					return d.ArgErr()
 				}
@@ -134,12 +138,31 @@ func (c *CaddyCNAME) UnmarshalCaddyfile(d *caddyfile.Dispenser) error {
 				if d.NextArg() {
 					return d.ArgErr()
 				}
+			case "strict":
+				c.Strict = true
+				if d.NextArg() {
+					return d.ArgErr()
+				}
 			default:
 				return d.Errf("'%s' is not expected.", d.Val())
 			}
 		}
 	}
 	return nil
+}
+
+func (c *CaddyCNAME) resolveCNAME(host string) (result string, err error) {
+	m := new(dns.Msg)
+	m.SetQuestion(dns.Fqdn(host), dns.TypeCNAME)
+	m.RecursionDesired = true
+	res, _, err := c.client.Exchange(m, c.ns)
+	if err != nil {
+		return "", err
+	}
+	if len(res.Answer) == 0 {
+		return "", fmt.Errorf("unable to resovle CNAME for %s", host)
+	}
+	return res.Answer[0].(*dns.CNAME).Target, nil
 }
 
 func parseCaddyfileHandler(h httpcaddyfile.Helper) (caddyhttp.MiddlewareHandler, error) {

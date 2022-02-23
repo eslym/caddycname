@@ -6,7 +6,10 @@
 
 http:// {
     route {
-        cname
+        resolve_cname {
+            nameserver 127.0.0.1:53
+            strict
+        }
     }
     respond * {http.request.host.cname}
 }
