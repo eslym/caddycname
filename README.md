@@ -8,7 +8,7 @@ Resolve host CNAME and put it into placeholder
         on_demand
     }
     route {
-        cname
+        resolve_cname
     }
     reverse_proxy * http://127.0.0.1:8080 {
         header_up Host {http.request.host.cname}
